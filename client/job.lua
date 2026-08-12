@@ -8,6 +8,8 @@ local currentGarage = 1 -- Initialized to 1 to prevent nil errors
 
 -- [[ 1. UTILITIES & VEHICLE MANAGEMENT ]]
 
+-- Builds a merged table of vehicle model->label the player can spawn,
+-- combining every grade tier at or below the player's own grade.
 local function getAuthorizedVehicles(grade)
     local accessibleVehicles = {}
     for availableGrade, vehicles in pairs(Config.AuthorizedVehicles) do
@@ -20,6 +22,9 @@ local function getAuthorizedVehicles(grade)
     return accessibleVehicles
 end
 
+-- Requests the server spawn an ambulance-job vehicle at the current garage,
+-- then plates it, fuels it, warps the player in, applies default extras,
+-- and hands over vehicle keys.
 function TakeOutVehicle(vehicleInfo)
     local coords = Config.Locations['vehicle'][currentGarage]
     TMGCore.Functions.TriggerCallback('TMGCore:Server:SpawnVehicle', function(netId)
@@ -36,13 +41,15 @@ function TakeOutVehicle(vehicleInfo)
     end, vehicleInfo, coords, true)
 end
 
+-- Opens the tmg-menu vehicle-garage menu listing every vehicle the
+-- player's job grade authorizes, each wired to TakeOutVehicle.
 function MenuGarage()
     local vehicleMenu = {
         { header = Lang:t('menu.amb_vehicles'), isMenuHeader = true }
     }
     local grade = (PlayerJob and PlayerJob.grade) and PlayerJob.grade.level or 0
     local authorizedVehicles = getAuthorizedVehicles(grade)
-    
+
     for veh, label in pairs(authorizedVehicles) do
         vehicleMenu[#vehicleMenu + 1] = {
             header = label, txt = '',
@@ -55,12 +62,16 @@ function MenuGarage()
     exports['tmg-menu']:openMenu(vehicleMenu)
 end
 
+-- Menu callback wrapper for TakeOutVehicle.
 RegisterNetEvent('ambulance:client:TakeOutVehicle', function(data)
     TakeOutVehicle(data.vehicle)
 end)
 
 -- [[ 2. PLAYER & JOB STATE SYNC ]]
 
+-- Keeps the local PlayerJob/onDuty cache in sync with the framework's job
+-- state, and registers/deregisters the player as an on-duty doctor with the
+-- hospital server module when their ambulance duty status changes.
 RegisterNetEvent('TMGCore:Client:OnJobUpdate', function(JobInfo)
     PlayerJob = JobInfo
     if PlayerJob.name == 'ambulance' then
@@ -73,6 +84,8 @@ RegisterNetEvent('TMGCore:Client:OnJobUpdate', function(JobInfo)
     end
 end)
 
+-- Reacts to a duty toggle: registers/deregisters as an on-duty doctor if
+-- the ambulance job's duty state actually changed.
 RegisterNetEvent('TMGCore:Client:SetDuty', function(duty)
     if PlayerJob.name == 'ambulance' and duty ~= onDuty then
         if duty then
@@ -84,11 +97,14 @@ RegisterNetEvent('TMGCore:Client:SetDuty', function(duty)
     onDuty = duty
 end)
 
+-- On player load: disables built-in health regen (handled manually),
+-- restores the player's saved job/armor state, and resumes death/last-stand
+-- presentation if the character was left dead or downed on last logout.
 RegisterNetEvent('TMGCore:Client:OnPlayerLoaded', function()
     exports.spawnmanager:setAutoSpawn(false)
     local ped = PlayerPedId()
     local player = PlayerId()
-    
+
     CreateThread(function()
         Wait(5000)
         SetEntityMaxHealth(ped, 200)
@@ -96,14 +112,14 @@ RegisterNetEvent('TMGCore:Client:OnPlayerLoaded', function()
         SetPlayerHealthRechargeMultiplier(player, 0.0)
         SetPlayerHealthRechargeLimit(player, 0.0)
     end)
-    
+
     CreateThread(function()
         Wait(1000)
         TMGCore.Functions.GetPlayerData(function(PlayerData)
             PlayerJob = PlayerData.job
             onDuty = PlayerData.job.onduty
             SetPedArmour(PlayerPedId(), PlayerData.metadata['armor'])
-            
+
             if (not PlayerData.metadata['inlaststand'] and PlayerData.metadata['isdead']) then
                 MedState.deathTime = Config.ReviveInterval
                 if OnDeath then OnDeath() end
@@ -114,7 +130,7 @@ RegisterNetEvent('TMGCore:Client:OnPlayerLoaded', function()
                 TriggerServerEvent('hospital:server:SetDeathStatus', false)
                 TriggerServerEvent('hospital:server:SetLaststandStatus', false)
             end
-            
+
             if PlayerJob.name == 'ambulance' and onDuty then
                 TriggerServerEvent('hospital:server:AddDoctor', PlayerJob.name)
             end
@@ -122,6 +138,8 @@ RegisterNetEvent('TMGCore:Client:OnPlayerLoaded', function()
     end)
 end)
 
+-- On character unload: deregisters the player as an on-duty doctor if they
+-- were on ambulance duty.
 RegisterNetEvent('TMGCore:Client:OnPlayerUnload', function()
     if PlayerJob.name == 'ambulance' and onDuty then
         TriggerServerEvent('hospital:server:RemoveDoctor', PlayerJob.name)
@@ -130,6 +148,8 @@ end)
 
 -- [[ 3. MEDICAL PROCEDURES (REVIVE, TREAT, STATUS) ]]
 
+-- Opens the health-status result menu (one entry per checked-in injury) if
+-- a status check is currently active.
 function Status()
     if MedState.statusChecking then
         local statusMenu = { { header = Lang:t('menu.status'), isMenuHeader = true } }
@@ -143,8 +163,12 @@ function Status()
     end
 end
 
+-- Checks the health status of the nearest player (within 5m): requests
+-- their injury/bleed/weapon-wound data from the server, reports bleed and
+-- weapon-wound info to chat, builds the status-check menu for other
+-- injuries, and opens it via Status().
 RegisterNetEvent('hospital:client:CheckStatus', function()
-    local player, distance = TMGCore.Functions.GetClosestPlayer() 
+    local player, distance = TMGCore.Functions.GetClosestPlayer()
     if player ~= -1 and distance < 5.0 then
         local playerId = GetPlayerServerId(player)
         TMGCore.Functions.TriggerCallback('hospital:GetPlayerStatus', function(result)
@@ -175,14 +199,17 @@ RegisterNetEvent('hospital:client:CheckStatus', function()
     end
 end)
 
+-- Revives the nearest player (within 5m) using a first-aid kit: plays the
+-- CPR animation/progressbar, then tells the server to revive them on
+-- success, or cancels the animation if interrupted.
 RegisterNetEvent('hospital:client:RevivePlayer', function()
     if TMGCore.Functions.HasItem('firstaid') then
         local player, distance = TMGCore.Functions.GetClosestPlayer()
         if player ~= -1 and distance < 5.0 then
             local playerId = GetPlayerServerId(player)
-            local dict = MedicalAnims.healAction.dict 
+            local dict = MedicalAnims.healAction.dict
             local anim = MedicalAnims.healAction.anim
-            
+
             TMGCore.Functions.Progressbar('hospital_revive', Lang:t('progress.revive'), 5000, false, true, {
                 disableMovement = true, disableCarMovement = true, disableMouse = false, disableCombat = true,
             }, { animDict = dict, anim = anim, flags = 33, }, {}, {}, function() -- Done
@@ -201,6 +228,9 @@ RegisterNetEvent('hospital:client:RevivePlayer', function()
     end
 end)
 
+-- Treats the nearest player's (within 5m) wounds using a bandage: plays a
+-- healing animation/progressbar, then tells the server to heal their
+-- wounds on success, or cancels the animation if interrupted.
 RegisterNetEvent('hospital:client:TreatWounds', function()
     if TMGCore.Functions.HasItem('bandage') then
         local player, distance = TMGCore.Functions.GetClosestPlayer()
@@ -208,7 +238,7 @@ RegisterNetEvent('hospital:client:TreatWounds', function()
             local playerId = GetPlayerServerId(player)
             local dict = MedicalAnims.healAction.dict
             local anim = MedicalAnims.healAction.anim
-            
+
             TMGCore.Functions.Progressbar('hospital_healwounds', Lang:t('progress.healing'), 5000, false, true, {
                 disableMovement = true, disableCarMovement = true, disableMouse = false, disableCombat = true,
             }, { animDict = dict, anim = anim, flags = 33, }, {}, {}, function() -- Done
@@ -229,40 +259,46 @@ end)
 
 -- [[ 4. ELEVATOR LOGIC ]]
 
+-- Fades out, teleports the player to the roof elevator destination for the
+-- given index, then fades back in.
 RegisterNetEvent('tmg-ambulancejob:elevator_roof', function(index)
     local ped = PlayerPedId()
-    local targetIndex = index or 1 
-    
-    DoScreenFadeOut(500)
-    while not IsScreenFadedOut() do Wait(10) end
-    
-    local coords = Config.Locations['main'][targetIndex]
-    if coords then
-        SetEntityCoords(ped, coords.x, coords.y, coords.z, false, false, false, false)
-        SetEntityHeading(ped, coords.w)
-    end
-    
-    Wait(100)
-    DoScreenFadeIn(1000)
-end)
+    local targetIndex = index or 1
 
-RegisterNetEvent('tmg-ambulancejob:elevator_main', function(index)
-    local ped = PlayerPedId()
-    local targetIndex = index or 1 
-    
     DoScreenFadeOut(500)
     while not IsScreenFadedOut() do Wait(10) end
-    
+
     local coords = Config.Locations['roof'][targetIndex]
     if coords then
         SetEntityCoords(ped, coords.x, coords.y, coords.z, false, false, false, false)
-        SetEntityHeading(ped, coords.w)
+        SetEntityHeading(ped, coords.w or GetEntityHeading(ped))
     end
-    
+
     Wait(100)
     DoScreenFadeIn(1000)
 end)
 
+-- Fades out, teleports the player to the ground-floor elevator destination
+-- for the given index, then fades back in.
+RegisterNetEvent('tmg-ambulancejob:elevator_main', function(index)
+    local ped = PlayerPedId()
+    local targetIndex = index or 1
+
+    DoScreenFadeOut(500)
+    while not IsScreenFadedOut() do Wait(10) end
+
+    local coords = Config.Locations['main'][targetIndex]
+    if coords then
+        SetEntityCoords(ped, coords.x, coords.y, coords.z, false, false, false, false)
+        SetEntityHeading(ped, coords.w or GetEntityHeading(ped))
+    end
+
+    Wait(100)
+    DoScreenFadeIn(1000)
+end)
+
+-- Toggles on-duty status locally and requests the server flip duty and
+-- refresh police blip visibility (ambulance duty affects blip sharing).
 RegisterNetEvent('EMSToggle:Duty', function()
     onDuty = not onDuty
     TriggerServerEvent('TMGCore:ToggleDuty')
@@ -273,16 +309,20 @@ end)
 
 local isJobListening = false
 
+-- Stops the currently running JobInteractionControls polling thread.
 function StopJobListener() isJobListening = false end
 
+-- Starts a polling thread (if not already listening) that waits for [E]
+-- and dispatches the appropriate job action (duty sign-in, stash, elevator,
+-- vehicle/helicopter spawn or store) based on `mode`.
 local function JobInteractionControls(mode, index)
-    if isJobListening then return end 
+    if isJobListening then return end
     CreateThread(function()
         isJobListening = true
         while isJobListening do
             if IsControlJustReleased(0, 38) then
                 exports['tmg-core']:KeyPressed(38)
-                
+
                 if mode == 'sign' then TriggerEvent('EMSToggle:Duty')
                 elseif mode == 'stash' then TriggerServerEvent('tmg-ambulancejob:server:stash')
                 elseif mode == 'roof' then TriggerEvent('tmg-ambulancejob:elevator_main', index)
@@ -305,7 +345,7 @@ local function JobInteractionControls(mode, index)
                             local veh = NetToVeh(netId)
                             SetVehicleNumberPlateText(veh, Lang:t('info.heli_plate') .. tostring(math.random(1000, 9999)))
                             SetEntityHeading(veh, coords.w)
-                            SetVehicleLivery(veh, 1) 
+                            SetVehicleLivery(veh, 1)
                             exports['LegacyFuel']:SetFuel(veh, 100.0)
                             TaskWarpPedIntoVehicle(PlayerPedId(), veh, -1)
                             TriggerEvent('vehiclekeys:client:SetOwner', TMGCore.Functions.GetPlate(veh))
@@ -313,7 +353,7 @@ local function JobInteractionControls(mode, index)
                         end, Config.Helicopter, coords, true)
                     end
                 end
-                isJobListening = false 
+                isJobListening = false
             end
             Wait(0)
         end
@@ -322,6 +362,10 @@ end
 
 -- [[ 6. REGISTRATION MATRIX ]]
 
+-- Sets up interaction zones for duty sign-in, stash, elevators, and
+-- vehicle/helicopter garages, using tmg-target boxzones if Config.UseTarget
+-- is enabled, otherwise falling back to PolyZone boxzones/combozones with
+-- manual proximity prompts gated on job/duty state.
 local function RegisterJobZones()
     if Config.UseTarget then
         for i = 1, #Config.Locations['duty'] do
@@ -362,7 +406,7 @@ local function RegisterJobZones()
         end
     else
         -- PolyZone Initialization
-        local signPoly, stashPoly, roofPoly, mainPoly, vehPoly, heliPoly = {}, {}, {}, {}, {}, {}        
+        local signPoly, stashPoly, roofPoly, mainPoly, vehPoly, heliPoly = {}, {}, {}, {}, {}, {}
         -- Build Arrays
         for i = 1, #Config.Locations['duty'] do local v = Config.Locations['duty'][i] signPoly[#signPoly + 1] = BoxZone:Create(vector3(v.x, v.y, v.z), 1.5, 1, { name = 'sign' .. i, heading = -20, minZ = v.z - 2, maxZ = v.z + 2 }) end
         for i = 1, #Config.Locations['stash'] do local v = Config.Locations['stash'][i] stashPoly[#stashPoly + 1] = BoxZone:Create(vector3(v.x, v.y, v.z), 1, 1, { name = 'stash' .. i, heading = -20, minZ = v.z - 2, maxZ = v.z + 2 }) end

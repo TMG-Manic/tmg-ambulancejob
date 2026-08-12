@@ -1,3 +1,4 @@
+-- English locale strings for tmg-ambulancejob (death/wound/revive notifications, hospital menus, EMS text, body-part and pain labels).
 local Translations = {
     error = {
         canceled = 'Canceled',
@@ -11,7 +12,8 @@ local Translations = {
         not_enough_money = 'You don\'t have enough money on you...',
         cant_help = 'You can\'t help this person...',
         not_ems = 'You are not EMS or not signed in',
-        not_online = 'Player Not Online'
+        not_online = 'Player Not Online',
+        too_far = 'You are too far away'
     },
     success = {
         revived = 'You revived a person',
@@ -37,6 +39,7 @@ local Translations = {
         status = 'Status Check',
         is_status = 'Is %{status}',
         healthy = 'You are completely healthy again!',
+        admin_healed = 'You have been healed by an admin!',
         safe = 'Hospital Safe',
         pb_hospital = 'Pillbox Hospital',
         paleto_hospital = 'Paleto Hospital',

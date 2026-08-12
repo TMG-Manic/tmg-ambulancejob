@@ -16,12 +16,12 @@ MedState = {
     advanceBleed = 0,
     fadeOut = 0,
     blackout = 0,
-    
+
     bedOccupying = nil,
     bedData = nil,
     bedObject = nil,
     cam = nil,
-    
+
     statusChecking = false,
     statusChecks = {},
     statusCheckTime = 0,
@@ -63,16 +63,19 @@ local isListening = false
 local moveState = { isLimping = false, animSet = 'move_m@injured' }
 
 
+-- Applies ongoing bleed damage to the player's health every 5s while
+-- MedState.isBleeding is active (or while dead), ticking fast (sleep 0)
+-- during those states and idling otherwise.
 CreateThread(function()
     while true do
         local sleep = 1000
         if MedState.isDead or MedState.isBleeding > 0 then
-            sleep = 0 
+            sleep = 0
             if MedState.isBleeding > 0 then
                 if GetGameTimer() > MedState.bleedTick then
                     local ped = PlayerPedId()
                     SetEntityHealth(ped, GetEntityHealth(ped) - MedState.isBleeding)
-                    MedState.bleedTick = GetGameTimer() + 5000 
+                    MedState.bleedTick = GetGameTimer() + 5000
                 end
             end
         end
@@ -80,23 +83,26 @@ CreateThread(function()
     end
 end)
 
+-- Handles the "get out of bed" prompt/control, expires the active status
+-- check window, and periodically fires DoLimbAlert() based on
+-- Config.MessageTimer.
 CreateThread(function()
-    local limbTimer = 0 
+    local limbTimer = 0
     while true do
-        local sleep = 1000 
-        
+        local sleep = 1000
+
         if MedState.isInBed then
             if MedState.canLeaveBed then
                 sleep = 0
                 exports['tmg-core']:DrawText(Lang:t('text.bed_out'))
-                
+
                 if IsControlJustReleased(0, 38) then -- [E]
                     exports['tmg-core']:KeyPressed(38)
                     LeaveBed()
                     exports['tmg-core']:HideText()
                 end
             else
-                sleep = 250 
+                sleep = 250
             end
         end
 
@@ -119,6 +125,9 @@ CreateThread(function()
     end
 end)
 
+-- Watches for health/armor drops each tick; on a detected hit, resolves the
+-- damaging bone/weapon and routes it to CheckDamage (injury) or ApplyBleed,
+-- then runs CheckWeaponDamage and ProcessDamage for ongoing injury effects.
 CreateThread(function()
     local pHealth, pArmor = nil, nil
     while true do
@@ -164,6 +173,7 @@ CreateThread(function()
     end
 end)
 
+-- Creates map blips for all configured ambulance stations, once on load.
 CreateThread(function()
     local stations = Config.Locations['stations']
     for i = 1, #stations do
@@ -180,6 +190,8 @@ CreateThread(function()
 end)
 
 
+-- Finds the first unoccupied bed index for a given hospital; falls back to
+-- bed 1 if the hospital/beds table is missing or all beds are taken.
 function getClosestAvailableBed(hospitalIndex)
     local hospital = Config.Locations['hospital'][hospitalIndex]
     if not hospital or not hospital.beds then return 1 end
@@ -189,10 +201,12 @@ function getClosestAvailableBed(hospitalIndex)
             return i
         end
     end
-    return 1 
+    return 1
 end
 
 local WeaponHashes = {}
+-- Builds a lookup array of weapon hashes from Config.Weapons for use by
+-- GetDamagingWeapon.
 CreateThread(function()
     for weaponHash, data in pairs(Config.Weapons) do
         WeaponHashes[#WeaponHashes + 1] = { hash = weaponHash, data = data }
@@ -200,12 +214,16 @@ CreateThread(function()
 end)
 
 local CachedWeaponHashes = {}
+-- Builds a lookup array of all weapon hashes known to the core's shared
+-- weapon list, with their damage-reason labels, for CheckWeaponDamage.
 CreateThread(function()
     for k, v in pairs(TMGCore.Shared.Weapons) do
         CachedWeaponHashes[#CachedWeaponHashes + 1] = { hash = GetHashKey(k), name = k, reason = v.damagereason }
     end
 end)
 
+-- Returns the Config.Weapons data for the weapon that most recently damaged
+-- the ped, or nil if none of the tracked weapons match.
 function GetDamagingWeapon(ped)
     for i = 1, #WeaponHashes do
         local weapon = WeaponHashes[i]
@@ -216,6 +234,9 @@ function GetDamagingWeapon(ped)
     return nil
 end
 
+-- Rolls whether a given damage amount from `weapon` should count as an
+-- "injury" event; force-injury weapons always qualify, otherwise it's a
+-- damage-scaled random chance.
 function IsDamagingEvent(damageDone, weapon)
     if damageDone < 5 then return false end
     if Config.ForceInjuryWeapons[weapon] then return true end
@@ -227,30 +248,33 @@ function IsDamagingEvent(damageDone, weapon)
     return luck < (Config.HealthDamage * multi)
 end
 
+-- Notifies the player of their currently injured limbs and severities
+-- (or a generic "many places" message once the list is too long).
 function DoLimbAlert()
-    if MedState.isDead or MedState.inLastStand then return end 
+    if MedState.isDead or MedState.inLastStand then return end
 
-    local injuredCount = #MedState.injured 
+    local injuredCount = #MedState.injured
     if injuredCount == 0 then return end
 
     local limbDamageMsg = ""
-    if injuredCount <= Config.AlertShowInfo then 
+    if injuredCount <= Config.AlertShowInfo then
         local reportBuffer = {}
         for i = 1, injuredCount do
-            local data = MedState.injured[i] 
-            reportBuffer[#reportBuffer + 1] = Lang:t('info.pain_message', { 
-                limb = data.label, 
-                severity = Config.WoundStates[data.severity] 
+            local data = MedState.injured[i]
+            reportBuffer[#reportBuffer + 1] = Lang:t('info.pain_message', {
+                limb = data.label,
+                severity = Config.WoundStates[data.severity]
             })
         end
         limbDamageMsg = table.concat(reportBuffer, " | ")
     else
-        limbDamageMsg = Lang:t('info.many_places') 
+        limbDamageMsg = Lang:t('info.many_places')
     end
 
-    TMGCore.Functions.Notify(limbDamageMsg, 'primary') 
+    TMGCore.Functions.Notify(limbDamageMsg, 'primary')
 end
 
+-- Notifies the player of their current bleed-out state, if bleeding.
 function DoBleedAlert()
     if MedState.isDead or MedState.isBleeding <= 0 then return end
     local bleedData = Config.BleedingStates[MedState.isBleeding]
@@ -259,6 +283,8 @@ function DoBleedAlert()
     end
 end
 
+-- Increases the bleed level (capped at 4) by `level`; on change, alerts the
+-- player and syncs injury/bleed state to the server.
 function ApplyBleed(level)
     local newBleed = math.min(4, MedState.isBleeding + (tonumber(level) or 0))
     if newBleed ~= MedState.isBleeding then
@@ -266,15 +292,18 @@ function ApplyBleed(level)
         DoBleedAlert()
         TriggerServerEvent('hospital:server:SyncInjuries', {
             limbs = BodyParts,
-            isBleeding = MedState.isBleeding 
+            isBleeding = MedState.isBleeding
         })
     end
 end
 
+-- Returns true if any currently-damaged limp-causing body part is injured.
 function IsInjuryCausingLimp()
     return limpCount > 0
 end
 
+-- Applies or removes the limping movement clipset/sprint restriction based
+-- on whether the player currently has a limp-causing injury.
 function ProcessRunStuff(ped)
     local needsLimp = IsInjuryCausingLimp()
 
@@ -283,7 +312,7 @@ function ProcessRunStuff(ped)
         CreateThread(function()
             if not HasAnimSetLoaded(moveState.animSet) then
                 RequestAnimSet(moveState.animSet)
-                while not HasAnimSetLoaded(moveState.animSet) do Wait(5) end 
+                while not HasAnimSetLoaded(moveState.animSet) do Wait(5) end
             end
             SetPedMovementClipset(ped, moveState.animSet, 1.0)
             SetPlayerSprint(PlayerId(), false)
@@ -295,6 +324,9 @@ function ProcessRunStuff(ped)
     end
 end
 
+-- Clears only minor/moderate injuries (severity <= 2) and light bleeding
+-- (<= 2), used for partial healing (e.g. bandages); re-syncs state to the
+-- server and refreshes limp/alert state.
 function ResetPartial()
     for _, v in pairs(BodyParts) do
         if v.isDamaged and v.severity <= 2 then
@@ -320,7 +352,7 @@ function ResetPartial()
 
     TriggerServerEvent('hospital:server:SyncInjuries', {
         limbs = BodyParts,
-        isBleeding = MedState.isBleeding 
+        isBleeding = MedState.isBleeding
     })
 
     local ped = PlayerPedId()
@@ -329,6 +361,9 @@ function ResetPartial()
     DoBleedAlert()
 end
 
+-- Fully clears all bleed/injury state, blood decals, and weapon-damage
+-- tracking; used for full heals and revives. Syncs the cleared state and
+-- hunger/thirst reset to the server.
 function ResetAll()
     MedState.isBleeding = 0
     MedState.bleedTick = 0
@@ -336,11 +371,11 @@ function ResetAll()
     MedState.fadeOut = 0
     MedState.blackout = 0
     MedState.onPainKillers = false
-    
+
     MedState.injured = {}
     MedState.damageList = {}
-    
-    limpCount, legCount, armcount, headCount = 0, 0, 0, 0 
+
+    limpCount, legCount, armcount, headCount = 0, 0, 0, 0
 
     for _, v in pairs(BodyParts) do
         v.isDamaged = false
@@ -348,8 +383,8 @@ function ResetAll()
     end
 
     local ped = PlayerPedId()
-    ClearPedBloodDamage(ped) 
-    ResetPedMovementClipset(ped, 0.0) 
+    ClearPedBloodDamage(ped)
+    ResetPedMovementClipset(ped, 0.0)
 
     TriggerServerEvent('hospital:server:SyncInjuries', { limbs = BodyParts, isBleeding = 0 })
     TriggerServerEvent('hospital:server:SetWeaponDamage', MedState.damageList)
@@ -361,6 +396,8 @@ function ResetAll()
 end
 
 
+-- Checks whether a weapon name is already recorded in MedState.damageList
+-- (handles both array and keyed lookup forms).
 function IsInDamageList(damage)
     if not MedState.damageList then return false end
     if MedState.damageList[damage] then return true end
@@ -370,6 +407,10 @@ function IsInDamageList(damage)
     return false
 end
 
+-- Scans all known weapons for a recent hit on the ped; any new (not
+-- previously logged) weapon hit is notified to the player and appended to
+-- MedState.damageList, then synced to the server. Clears the last-damage
+-- entity flag afterward.
 function CheckWeaponDamage(ped)
     local hitDetected = false
     local newListEntry = false
@@ -392,12 +433,14 @@ function CheckWeaponDamage(ped)
     ClearEntityLastDamageEntity(ped)
 end
 
+-- Applies immediate reactive effects for a hit (bleed chance, ragdoll
+-- stagger) based on weapon severity class, hit body part, and armor state.
 function ApplyImmediateEffects(ped, bone, weapon, damageDone)
     local armor = GetPedArmour(ped)
     local boneArea = Config.Bones[bone]
     local isCritical = Config.CriticalAreas[boneArea]
     local staggerData = Config.StaggerAreas[boneArea]
-    
+
     local isMinor = Config.MinorInjurWeapons[weapon] and damageDone < Config.DamageMinorToMajor
     local isMajor = Config.MajorInjurWeapons[weapon] or (Config.MinorInjurWeapons[weapon] and damageDone >= Config.DamageMinorToMajor)
 
@@ -418,11 +461,14 @@ function ApplyImmediateEffects(ped, bone, weapon, damageDone)
     if staggerData and (staggerData.armored or armor <= 0) then
         local staggerChance = isMinor and staggerData.minor or staggerData.major
         if math.random(100) <= math.ceil(staggerChance) then
-            SetPedToRagdoll(ped, 1500, 2000, 3, true, true, false) 
+            SetPedToRagdoll(ped, 1500, 2000, 3, true, true, false)
         end
     end
 end
 
+-- Marks a body part (by bone ID) as freshly damaged with a random severity
+-- and records it in MedState.injured; increments limpCount if applicable.
+-- No-op if the bone doesn't map to a tracked part or it's already damaged.
 function ApplyBoneTrauma(boneId)
     local boneKey = Config.Bones[boneId]
     local part = BodyParts[boneKey]
@@ -442,6 +488,9 @@ function ApplyBoneTrauma(boneId)
     if part.limp then limpCount = limpCount + 1 end
 end
 
+-- Main damage-to-injury pipeline: applies immediate hit effects, then
+-- either creates a new injury entry for the hit body part or escalates its
+-- severity if already damaged, and syncs the result to the server.
 function CheckDamage(ped, bone, weapon, damageDone)
     if not weapon or MedState.isDead or MedState.inLastStand then return end
 
@@ -454,7 +503,7 @@ function CheckDamage(ped, bone, weapon, damageDone)
     if not partData.isDamaged then
         partData.isDamaged = true
         partData.severity = math.random(1, 3)
-        
+
         MedState.injured[#MedState.injured + 1] = { part = boneArea, label = partData.label, severity = partData.severity }
         if partData.limp then limpCount = limpCount + 1 end
     else
@@ -463,7 +512,7 @@ function CheckDamage(ped, bone, weapon, damageDone)
             for i = 1, #MedState.injured do
                 if MedState.injured[i].part == boneArea then
                     MedState.injured[i].severity = partData.severity
-                    break 
+                    break
                 end
             end
         end
@@ -473,6 +522,10 @@ function CheckDamage(ped, bone, weapon, damageDone)
     ProcessRunStuff(ped)
 end
 
+-- Applies ongoing gameplay penalties for existing injuries (leg ragdoll
+-- chance while moving, disabling aim/vehicle controls for arm injuries,
+-- screen-flash/ragdoll chance for head injuries), each throttled by its own
+-- per-category tick counter.
 function ProcessDamage(ped)
     if MedState.isDead or MedState.inLastStand or MedState.onPainKillers then return end
 
@@ -485,10 +538,10 @@ function ProcessDamage(ped)
             if legCount >= Config.LegInjuryTimer then
                 if not IsPedRagdoll(ped) and IsPedOnFoot(ped) then
                     local chance = math.random(100)
-                    local threshold = (IsPedRunning(ped) or IsPedSprinting(ped)) 
-                                      and Config.LegInjuryChance.Running 
+                    local threshold = (IsPedRunning(ped) or IsPedSprinting(ped))
+                                      and Config.LegInjuryChance.Running
                                       or Config.LegInjuryChance.Walking
-                    
+
                     if chance <= threshold then
                         ShakeGameplayCam('SMALL_EXPLOSION_SHAKE', 0.08)
                         SetPedToRagdollWithFall(ped, 1500, 2000, 1, GetEntityForwardVector(ped), 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
@@ -502,7 +555,7 @@ function ProcessDamage(ped)
         elseif category == 2 and severity > (v.part:find("ARM") and 1 or 2) then
             if armcount >= Config.ArmInjuryTimer then
                 if IsPedInAnyVehicle(ped, true) then
-                    DisableControlAction(0, 63, true) 
+                    DisableControlAction(0, 63, true)
                 end
                 if IsPlayerFreeAiming(PlayerId()) then
                     local action = (v.part:sub(1,1) == 'L') and 142 or 25
@@ -533,28 +586,33 @@ function ProcessDamage(ped)
 end
 
 
+-- Requests and waits (with a timeout) for an animation dictionary to load;
+-- returns true on success, false if it times out or is already loaded.
 function loadAnimDict(dict)
     if HasAnimDictLoaded(dict) then return end
     local timeout = 0
     RequestAnimDict(dict)
     while not HasAnimDictLoaded(dict) do
-        Wait(5) 
+        Wait(5)
         timeout = timeout + 1
-        if timeout > 1000 then 
+        if timeout > 1000 then
             print("^1[TMG Error]^7 Failed to load animation dictionary: " .. tostring(dict))
-            return false 
+            return false
         end
     end
     return true
 end
 
+-- Places the player into the bed-lying state: fades out, resurrects if
+-- dead, teleports/freezes the ped onto the bed, plays the idle anim, and
+-- sets up a scripted first-person-ish bed camera before fading back in.
 function SetBedCam()
     MedState.isInBed = true
     MedState.canLeaveBed = false
     local ped = PlayerPedId()
 
     DoScreenFadeOut(1000)
-    while not IsScreenFadedOut() do Wait(10) end 
+    while not IsScreenFadedOut() do Wait(10) end
 
     if IsPedDeadOrDying(ped) then
         local pos = GetEntityCoords(ped, true)
@@ -579,16 +637,19 @@ function SetBedCam()
     MedState.cam = CreateCam('DEFAULT_SCRIPTED_CAMERA', 1)
     SetCamActive(MedState.cam, true)
     RenderScriptCams(true, false, 1, true, true)
-    
+
     AttachCamToPedBone(MedState.cam, ped, 31085, 0, 1.0, 1.0, true)
     SetCamFov(MedState.cam, 90.0)
-    
+
     local camHeading = (GetEntityHeading(ped) + 180.0) % 360.0
     SetCamRot(MedState.cam, -45.0, 0.0, camHeading, 2)
 
     DoScreenFadeIn(1000)
 end
 
+-- Exits the bed state: plays the get-up anim, unfreezes the ped, destroys
+-- the bed camera, notifies the server the bed is free, and re-enters prison
+-- state if the player was jailed while in bed.
 function LeaveBed()
     local ped = PlayerPedId()
     local dict = MedicalAnims.bedExit.dict
@@ -602,23 +663,23 @@ function LeaveBed()
     FreezeEntityPosition(ped, false)
     SetEntityInvincible(ped, false)
     SetEntityHeading(ped, MedState.bedData.coords.w + 90)
-    
+
     TriggerServerEvent('hospital:server:LeaveBed', MedState.bedOccupying, MedState.hospitalLocation)
-    
-    RenderScriptCams(0, true, 500, true, true) 
+
+    RenderScriptCams(0, true, 500, true, true)
     if MedState.cam then
         DestroyCam(MedState.cam, false)
         MedState.cam = nil
     end
 
     TaskPlayAnim(ped, dict, anim, 8.0, -8.0, -1, 48, 0, false, false, false)
-    
+
     MedState.isInBed = false
     MedState.bedOccupying = nil
     MedState.bedObject = nil
     MedState.bedData = nil
 
-    local PlayerData = TMGCore.Functions.GetPlayerData() 
+    local PlayerData = TMGCore.Functions.GetPlayerData()
     if PlayerData.metadata['injail'] > 0 then
         TriggerEvent('prison:client:Enter', PlayerData.metadata['injail'])
     end
@@ -627,32 +688,48 @@ function LeaveBed()
 end
 
 
+-- Stops the currently running CheckInControls polling thread.
 function StopInteractionListener()
     isListening = false
 end
 
+-- Starts a polling thread (if not already listening) that waits for the
+-- player to press [E], then fires the check-in or bed-interaction event.
 function CheckInControls(mode, hospitalIndex, bedId)
-    if isListening then return end 
+    if isListening then return end
 
     CreateThread(function()
         isListening = true
         while isListening do
             if IsControlJustReleased(0, 38) then -- [E]
                 exports['tmg-core']:KeyPressed(38)
-                
+
                 if mode == 'checkin' then
                     TriggerEvent('tmg-ambulancejob:checkin', hospitalIndex)
                 elseif mode == 'beds' then
                     TriggerEvent('tmg-ambulancejob:beds', hospitalIndex, bedId)
                 end
-                
-                isListening = false 
+
+                isListening = false
             end
-            Wait(0) 
+            Wait(0)
         end
     end)
 end
 
+-- True while the player stands in a check-in zone, so the prompt can be redrawn if
+-- the on-duty doctor count changes underneath them.
+local inCheckInZone = false
+
+-- Draws the check-in prompt with the label matching the current doctor count.
+local function DrawCheckInPrompt()
+    local label = (MedState.doctorCount >= Config.MinimalDoctors) and Lang:t('text.call_doc') or Lang:t('text.check_in')
+    exports['tmg-core']:DrawText(label, 'left')
+end
+
+-- Sets up interaction zones for hospital check-in desks and beds, using
+-- tmg-target boxzones if Config.UseTarget is enabled, otherwise falling
+-- back to PolyZone boxzones/combozones with manual proximity prompts.
 local function RegisterMedicalInteractions()
     if Config.UseTarget then
         for i = 1, #Config.Locations['checking'] do
@@ -691,10 +768,11 @@ local function RegisterMedicalInteractions()
         local checkingCombo = ComboZone:Create(checkingPoly, { name = 'checkingCombo', debugPoly = false })
         checkingCombo:onPlayerInOut(function(isPointInside, _, zone)
             if isPointInside then
-                local label = (MedState.doctorCount >= Config.MinimalDoctors) and Lang:t('text.call_doc') or Lang:t('text.check_in')
-                exports['tmg-core']:DrawText(label, 'left')
+                inCheckInZone = true
+                DrawCheckInPrompt()
                 CheckInControls('checkin', zone.data.id)
             else
+                inCheckInZone = false
                 StopInteractionListener()
                 exports['tmg-core']:HideText()
             end
@@ -725,6 +803,9 @@ end
 CreateThread(RegisterMedicalInteractions)
 
 
+-- Displays a blip and notification for an EMS/ambulance alert at the given
+-- coords, with the street name(s) as caption; fades the blip's alpha out
+-- and removes it after ~125s.
 RegisterNetEvent('hospital:client:ambulanceAlert', function(coords, text)
     local street1, street2 = GetStreetNameAtCoord(coords.x, coords.y, coords.z)
     local locationText = GetStreetNameFromHashKey(street1)
@@ -734,7 +815,7 @@ RegisterNetEvent('hospital:client:ambulanceAlert', function(coords, text)
     PlaySoundFrontend(-1, 'Lose_1st', 'GTAO_FM_Events_Soundset', true)
 
     local blip = AddBlipForCoord(coords.x, coords.y, coords.z)
-    local radiusBlip = AddBlipForRadius(coords.x, coords.y, coords.z, 100.0) 
+    local radiusBlip = AddBlipForRadius(coords.x, coords.y, coords.z, 100.0)
     local blipText = Lang:t('info.ems_alert', { text = text })
 
     SetBlipSprite(blip, 153)
@@ -746,12 +827,12 @@ RegisterNetEvent('hospital:client:ambulanceAlert', function(coords, text)
     EndTextCommandSetBlipName(blip)
     SetBlipColour(radiusBlip, 1)
     SetBlipAlpha(radiusBlip, 128)
-    
+
     CreateThread(function()
         local alpha = 250
         while alpha > 0 do
-            Wait(1000) 
-            alpha = alpha - 2 
+            Wait(1000)
+            alpha = alpha - 2
             SetBlipAlpha(blip, alpha)
             SetBlipAlpha(radiusBlip, math.min(alpha, 128))
             if alpha <= 0 then break end
@@ -761,6 +842,9 @@ RegisterNetEvent('hospital:client:ambulanceAlert', function(coords, text)
     end)
 end)
 
+-- Revives the player: resurrects if dead/in last stand, clears all injuries
+-- and blood, restores full health and control, and notifies the server the
+-- death/last-stand state is cleared and stress is relieved.
 RegisterNetEvent('hospital:client:Revive', function()
     local ped = PlayerPedId()
     local lp = PlayerId()
@@ -773,7 +857,7 @@ RegisterNetEvent('hospital:client:Revive', function()
         SetLaststand(false)
     end
 
-    ResetAll() 
+    ResetAll()
     ClearPedBloodDamage(ped)
     SetEntityMaxHealth(ped, 200)
     SetEntityHealth(ped, 200)
@@ -800,6 +884,8 @@ RegisterNetEvent('hospital:client:Revive', function()
     TMGCore.Functions.Notify(Lang:t('info.healthy'), 'success')
 end)
 
+-- Admin/debug event: applies random bleed and forces trauma on two bones
+-- (head and pelvis), syncing the result to the server.
 RegisterNetEvent('hospital:client:SetPain', function()
     ApplyBleed(math.random(1, 4))
     ApplyBoneTrauma(24816)
@@ -807,10 +893,14 @@ RegisterNetEvent('hospital:client:SetPain', function()
     TriggerServerEvent('hospital:server:SyncInjuries', { limbs = BodyParts, isBleeding = MedState.isBleeding })
 end)
 
+-- Admin/debug event: sets the player's health to 0, triggering death.
 RegisterNetEvent('hospital:client:KillPlayer', function()
     SetEntityHealth(PlayerPedId(), 0)
 end)
 
+-- Heals the player's injuries, either fully (ResetAll) or partially
+-- (ResetPartial) depending on `healType`, then restores weapon-damage
+-- tracking server-side and notifies the player.
 RegisterNetEvent('hospital:client:HealInjuries', function(healType)
     if healType == 'full' then
         ResetAll()
@@ -821,6 +911,9 @@ RegisterNetEvent('hospital:client:HealInjuries', function(healType)
     TMGCore.Functions.Notify(Lang:t('success.wounds_healed'), 'success')
 end)
 
+-- Places the player into a specific hospital bed; if `isRevive` is set,
+-- treats it as an AI-assisted heal-over-time that auto-revives the player
+-- after Config.AIHealTimer seconds.
 RegisterNetEvent('hospital:client:SendToBed', function(id, data, isRevive)
     MedState.bedOccupying = id
     MedState.bedData = data
@@ -829,7 +922,7 @@ RegisterNetEvent('hospital:client:SendToBed', function(id, data, isRevive)
     if isRevive then
         TMGCore.Functions.Notify(Lang:t('success.being_helped'), 'success')
         MedState.isInBed = true
-        MedState.canLeaveBed = false 
+        MedState.canLeaveBed = false
 
         CreateThread(function()
             Wait(Config.AIHealTimer * 1000)
@@ -842,6 +935,8 @@ RegisterNetEvent('hospital:client:SendToBed', function(id, data, isRevive)
     end
 end)
 
+-- Updates the local occupied/free state of a hospital bed, and records the
+-- player's current hospital location if it's the bed they occupy.
 RegisterNetEvent('hospital:client:SetBed', function(id, isTaken, hospitalIndex)
     if not Config.Locations['hospital'][hospitalIndex] or not Config.Locations['hospital'][hospitalIndex]['beds'][id] then return end
     Config.Locations['hospital'][hospitalIndex]['beds'][id].taken = isTaken
@@ -850,20 +945,24 @@ RegisterNetEvent('hospital:client:SetBed', function(id, isTaken, hospitalIndex)
     end
 end)
 
+-- Updates the local occupied/free state of a jail bed.
 RegisterNetEvent('hospital:client:SetBed2', function(id, isTaken)
     if not Config.Locations['jailbeds'] or not Config.Locations['jailbeds'][id] then return end
     Config.Locations['jailbeds'][id].taken = isTaken
 end)
 
+-- Respawns the player at a hospital: picks the nearest configured hospital
+-- (if enabled) or defaults to the first, tells the server to respawn them
+-- there, and clears any handcuff/escort state.
 RegisterNetEvent('hospital:client:RespawnAtHospital', function()
-    local hospitalIndex = 1 
+    local hospitalIndex = 1
     local hospitals = Config.Locations["hospital"]
 
     if Config.RespawnAtNearestHospital and #hospitals > 0 then
         local ped = PlayerPedId()
         local coords = GetEntityCoords(ped)
         local closestDist = #(hospitals[1]["location"] - coords)
-        
+
         for i = 2, #hospitals do
             local dist = #(hospitals[i]["location"] - coords)
             if dist < closestDist then
@@ -879,11 +978,13 @@ RegisterNetEvent('hospital:client:RespawnAtHospital', function()
     exports['tmg-core']:HideText()
 end)
 
+-- After a random delay, sends a phone mail with the hospital bill amount
+-- to the player, addressed using their character's gender/lastname.
 RegisterNetEvent('hospital:client:SendBillEmail', function(amount, hospitalName)
     SetTimeout(math.random(2500, 4000), function()
         local PlayerData = TMGCore.Functions.GetPlayerData()
         if not PlayerData or not PlayerData.charinfo then return end
-        
+
         local charinfo = PlayerData.charinfo
         local genderLabel = (charinfo.gender == 1) and Lang:t('info.mrs') or Lang:t('info.mr')
 
@@ -895,6 +996,8 @@ RegisterNetEvent('hospital:client:SendBillEmail', function(amount, hospitalName)
     end)
 end)
 
+-- Updates the locally cached on-duty doctor count; refreshes the check-in
+-- prompt state if the count changed and the player isn't currently in bed.
 RegisterNetEvent('hospital:client:SetDoctorCount', function(amount)
     local newCount = tonumber(amount) or 0
     if newCount ~= MedState.doctorCount then
@@ -903,9 +1006,20 @@ RegisterNetEvent('hospital:client:SetDoctorCount', function(amount)
     end
 end)
 
+-- Fix: this was triggered above whenever the doctor count changed but never had a
+-- handler, so a prompt already on screen kept the label it was drawn with on entry
+-- ('call doctor' vs 'check in') even after the last doctor went off duty. Redraws it
+-- with the current count while the player is standing at a check-in desk.
+RegisterNetEvent('hospital:client:RefreshCheckInState', function()
+    if not inCheckInZone then return end
+    DrawCheckInPrompt()
+end)
+
+-- Admin heal event: clears all injuries/bleed, restores full health, and
+-- resets hunger/thirst server-side.
 RegisterNetEvent('hospital:client:adminHeal', function()
     local ped = PlayerPedId()
-    ResetAll() 
+    ResetAll()
     SetEntityHealth(ped, 200)
     ClearPedBloodDamage(ped)
     SetPlayerSprint(PlayerId(), true)
@@ -913,6 +1027,14 @@ RegisterNetEvent('hospital:client:adminHeal', function()
     TMGCore.Functions.Notify(Lang:t('info.admin_healed'), 'success')
 end)
 
+-- On character unload: releases any occupied bed and its camera, and clears
+-- local injury/dead state.
+-- Fix: this also fired 'hospital:server:FinalStateSync', which no handler was ever
+-- registered for. The trigger is removed rather than given one: death, last stand
+-- and armor are already pushed to metadata live by SetDeathStatus/SetLaststandStatus/
+-- SetArmor, the core saves the character immediately after firing this unload event
+-- (so a late write would be dropped anyway), and forcing death = false here would let
+-- a dead player clear their state by switching characters.
 RegisterNetEvent('TMGCore:Client:OnPlayerUnload', function()
     local ped = PlayerPedId()
     if MedState.bedOccupying then
@@ -925,19 +1047,21 @@ RegisterNetEvent('TMGCore:Client:OnPlayerUnload', function()
         MedState.bedOccupying = nil
     end
 
-    TriggerServerEvent('hospital:server:FinalStateSync', { death = false, laststand = false, armor = GetPedArmour(ped) })
-
     MedState.isDead = false
     SetEntityInvincible(ped, false)
     SetPedArmour(ped, 0)
     ResetAll()
 end)
 
+-- Handles a hospital check-in interaction: resolves which hospital (by
+-- coord proximity if not provided), either alerts an on-duty doctor if
+-- enough are online, or plays a checking-in progressbar and sends the
+-- player to the closest available bed.
 RegisterNetEvent('tmg-ambulancejob:checkin', function(providedIndex)
     local ped = PlayerPedId()
     local coords = GetEntityCoords(ped)
     local hIndex = providedIndex
-    
+
     if not hIndex then
         for i = 1, #Config.Locations['hospital'] do
             if #(coords - Config.Locations['hospital'][i]['location']) < 3 then
@@ -958,7 +1082,7 @@ RegisterNetEvent('tmg-ambulancejob:checkin', function(providedIndex)
         }, { animDict = 'missheistdockssetup1clipboard@base', anim = 'base', flags = 33,
         }, { model = 'prop_notepad_01', bone = 18905, coords = { x = 0.1, y = 0.02, z = 0.05 }, rotation = { x = 10.0, y = 0.0, z = 0.0 },
         }, { model = 'prop_pencil_01', bone = 58866, coords = { x = 0.11, y = -0.02, z = 0.001 }, rotation = { x = -120.0, y = 0.0, z = 0.0 },
-        }, function() 
+        }, function()
             TriggerEvent('animations:client:EmoteCommandStart', { 'c' })
             local bedId = getClosestAvailableBed(hIndex)
             if bedId then
@@ -971,12 +1095,14 @@ RegisterNetEvent('tmg-ambulancejob:checkin', function(providedIndex)
     end
 end)
 
+-- Handles a bed-interaction request: validates the target bed exists and
+-- the player is close enough, then requests the server assign the bed.
 RegisterNetEvent('tmg-ambulancejob:beds', function(hospitalIndex, bedId)
     if not hospitalIndex or not bedId then return TMGCore.Functions.Notify(Lang:t('error.beds_taken'), 'error') end
     local ped = PlayerPedId()
     local coords = GetEntityCoords(ped)
     local targetBed = Config.Locations['hospital'][hospitalIndex]['beds'][bedId]
-    
+
     if targetBed and #(coords - targetBed.coords) < 3.0 then
         TriggerServerEvent('hospital:server:SendToBed', bedId, false, hospitalIndex)
         MedState.hospitalLocation = hospitalIndex

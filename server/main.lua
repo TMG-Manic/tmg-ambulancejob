@@ -5,10 +5,60 @@ local doctorCount = 0
 local doctorCalled = false
 local Doctors = {}
 
+-- Fix: the bed 'taken' flags in the shared config were only ever flipped client side,
+-- so every server-side "is this bed free" scan saw all beds as free and dumped every
+-- patient into bed 1. Occupancy is tracked here instead.
+local OccupiedBeds = {}     -- [hospitalIndex][bedId] = true
+local OccupiedJailBeds = {} -- [bedId] = true
+local PlayerBeds = {}       -- [src] = { bedId = number, hospitalIndex = number|nil }
+
+-- Flags a bed as occupied by src and remembers it so it can be released later.
+-- A nil hospitalIndex means a jail bed.
+local function TakeBed(src, bedId, hospitalIndex)
+	if hospitalIndex then
+		if not OccupiedBeds[hospitalIndex] then OccupiedBeds[hospitalIndex] = {} end
+		OccupiedBeds[hospitalIndex][bedId] = true
+	else
+		OccupiedJailBeds[bedId] = true
+	end
+	PlayerBeds[src] = { bedId = bedId, hospitalIndex = hospitalIndex }
+end
+
+-- Frees whatever bed src was occupying, if any.
+local function ReleaseBed(src)
+	local bed = PlayerBeds[src]
+	if not bed then return end
+	if bed.hospitalIndex then
+		if OccupiedBeds[bed.hospitalIndex] then OccupiedBeds[bed.hospitalIndex][bed.bedId] = nil end
+	else
+		OccupiedJailBeds[bed.bedId] = nil
+	end
+	PlayerBeds[src] = nil
+end
+
+-- First free bed index for a hospital, or for the jail beds when hospitalIndex is
+-- nil. Returns nil when every bed is occupied.
+local function GetFreeBed(hospitalIndex)
+	if hospitalIndex then
+		local hospital = Config.Locations['hospital'][hospitalIndex]
+		if not hospital then return nil end
+		for i = 1, #hospital['beds'] do
+			if not (OccupiedBeds[hospitalIndex] and OccupiedBeds[hospitalIndex][i]) then return i end
+		end
+	else
+		for i = 1, #Config.Locations['jailbeds'] do
+			if not OccupiedJailBeds[i] then return i end
+		end
+	end
+	return nil
+end
+
 -- Events
 
 -- Compatibility with txAdmin Menu's heal options.
 -- This is an admin only server side event that will pass the target player id or -1.
+-- Only accepts calls from the txAdmin/monitor resource; fully revives and
+-- heals the given player id (or -1 for all/self, per txAdmin convention).
 AddEventHandler('txAdmin:events:healedPlayer', function(eventData)
 	if GetInvokingResource() ~= 'monitor' or type(eventData) ~= 'table' or type(eventData.id) ~= 'number' then
 		return
@@ -18,16 +68,32 @@ AddEventHandler('txAdmin:events:healedPlayer', function(eventData)
 	TriggerClientEvent('hospital:client:HealInjuries', eventData.id, 'full')
 end)
 
+-- Assigns a specific hospital bed to the calling player, broadcasts the
+-- bed as taken, charges the treatment bill, and emails the bill receipt.
 RegisterNetEvent('hospital:server:SendToBed', function(bedId, isRevive, hospitalIndex)
 	local src = source
 	local Player = TMGCore.Functions.GetPlayer(src)
-	TriggerClientEvent('hospital:client:SendToBed', src, bedId, Config.Locations['hospital'][hospitalIndex]['beds'][bedId], isRevive)
+	if not Player then return end
+	local hospital = Config.Locations['hospital'][hospitalIndex]
+	if not hospital or not hospital['beds'][bedId] then return end
+	-- Fix: the requested bed can already be occupied by the time this arrives, so
+	-- fall back to the first free one and only refuse when the hospital is full.
+	if OccupiedBeds[hospitalIndex] and OccupiedBeds[hospitalIndex][bedId] then
+		bedId = GetFreeBed(hospitalIndex)
+		if not bedId then return TriggerClientEvent('TMGCore:Notify', src, Lang:t('error.beds_taken'), 'error') end
+	end
+	TakeBed(src, bedId, hospitalIndex)
+	TriggerClientEvent('hospital:client:SendToBed', src, bedId, hospital['beds'][bedId], isRevive)
 	TriggerClientEvent('hospital:client:SetBed', -1, bedId, true, hospitalIndex)
 	Player.Functions.RemoveMoney('bank', Config.BillCost, 'respawned-at-hospital')
 	exports['tmg-banking']:AddMoney('ambulance', Config.BillCost, 'Player treatment')
-	TriggerClientEvent('hospital:client:SendBillEmail', src, Config.BillCost, Config.Locations['hospital'][hospitalIndex]['name'])
+	TriggerClientEvent('hospital:client:SendBillEmail', src, Config.BillCost, hospital['name'])
 end)
 
+-- Respawns the player into a free bed: a jail bed if they're jailed,
+-- otherwise a bed at the given hospital (falling back to bed 1 if none are
+-- free); optionally wipes their inventory via tmgnosql, then charges and
+-- emails the treatment bill.
 RegisterNetEvent('hospital:server:RespawnAtHospital', function(hospitalIndex)
     local src = source
     local Player = TMGCore.Functions.GetPlayer(src)
@@ -42,56 +108,42 @@ RegisterNetEvent('hospital:server:RespawnAtHospital', function(hospitalIndex)
         TriggerClientEvent('TMGCore:Notify', targetPlayer.PlayerData.source, Lang:t('error.possessions_taken'), 'error')
     end
 
+    -- Fix: both bed scans read the shared config's `taken` flags, which only the
+    -- clients ever write, so the first bed always looked free and everyone ended up
+    -- in it. The server-side occupancy table is authoritative now, and the bed is
+    -- claimed for this player before they are sent to it. Bed 1 stays the fallback
+    -- when every bed really is full, since the player still has to respawn somewhere.
+    -- The jail fallback also broadcast 'SetBed' instead of 'SetBed2', so it flagged a
+    -- hospital bed rather than the jail bed it just used.
     if Player.PlayerData.metadata['injail'] > 0 then
-        for i = 1, #Config.Locations['jailbeds'] do
-            local v = Config.Locations['jailbeds'][i]
-            if not v.taken then
-                TriggerClientEvent('hospital:client:SendToBed', src, i, v, true)
-                TriggerClientEvent('hospital:client:SetBed2', -1, i, true)
-                if Config.WipeInventoryOnRespawn then WipeInventoryNoSQL(Player) end -- Fixed NoSQL
-                
-                Player.Functions.RemoveMoney('bank', Config.BillCost, 'respawned-at-hospital')
-                exports['tmg-banking']:AddMoney('ambulance', Config.BillCost, 'Player treatment')
-                TriggerClientEvent('hospital:client:SendBillEmail', src, Config.BillCost)
-                return
-            end
-        end
-        -- Fallback Jail Bed
-        TriggerClientEvent('hospital:client:SendToBed', src, 1, Config.Locations['jailbeds'][1], true)
-        TriggerClientEvent('hospital:client:SetBed', -1, 1, true)
+        local bedId = GetFreeBed() or 1
+        TakeBed(src, bedId, nil)
+        TriggerClientEvent('hospital:client:SendToBed', src, bedId, Config.Locations['jailbeds'][bedId], true)
+        TriggerClientEvent('hospital:client:SetBed2', -1, bedId, true)
         if Config.WipeInventoryOnRespawn then WipeInventoryNoSQL(Player) end -- Fixed NoSQL
     else
         -- Regular Hospital Beds
-        for i = 1, #Config.Locations['hospital'][hospitalIndex]['beds'] do
-            local v = Config.Locations['hospital'][hospitalIndex]['beds'][i]
-            if not v.taken then
-                TriggerClientEvent('hospital:client:SendToBed', src, i, v, true)
-                TriggerClientEvent('hospital:client:SetBed', -1, i, true, hospitalIndex)
-                if Config.WipeInventoryOnRespawn then WipeInventoryNoSQL(Player) end -- Fixed NoSQL
-                
-                Player.Functions.RemoveMoney('bank', Config.BillCost, 'respawned-at-hospital')
-                exports['tmg-banking']:AddMoney('ambulance', Config.BillCost, 'Player treatment')
-                TriggerClientEvent('hospital:client:SendBillEmail', src, Config.BillCost, Config.Locations['hospital'][hospitalIndex]['name'])
-                return
-            end
-        end
-        -- Fallback Regular Bed
-        TriggerClientEvent('hospital:client:SendToBed', src, 1, Config.Locations['hospital'][hospitalIndex]['beds'][1], true)
-        TriggerClientEvent('hospital:client:SetBed', -1, 1, true, hospitalIndex)
+        local bedId = GetFreeBed(hospitalIndex) or 1
+        TakeBed(src, bedId, hospitalIndex)
+        TriggerClientEvent('hospital:client:SendToBed', src, bedId, Config.Locations['hospital'][hospitalIndex]['beds'][bedId], true)
+        TriggerClientEvent('hospital:client:SetBed', -1, bedId, true, hospitalIndex)
         if Config.WipeInventoryOnRespawn then WipeInventoryNoSQL(Player) end -- Fixed NoSQL
     end
-    
-    -- Common Money Logic for fallback
+
+    -- Common Money Logic
+    local hospital = Config.Locations['hospital'][hospitalIndex]
     Player.Functions.RemoveMoney('bank', Config.BillCost, 'respawned-at-hospital')
     exports['tmg-banking']:AddMoney('ambulance', Config.BillCost, 'Player treatment')
-    TriggerClientEvent('hospital:client:SendBillEmail', src, Config.BillCost, Config.Locations['hospital'][hospitalIndex]['name'])
+    TriggerClientEvent('hospital:client:SendBillEmail', src, Config.BillCost, hospital and hospital['name'])
 end)
 
+-- Broadcasts an EMS alert (with the sender's coords and message text) to
+-- every on-duty ambulance job player.
 RegisterNetEvent('hospital:server:ambulanceAlert', function(text)
 	local src = source
 	local ped = GetPlayerPed(src)
 	local coords = GetEntityCoords(ped)
-	local players = TMGCore.Functions.GetQBPlayers()
+	local players = TMGCore.Functions.GetTMGPlayers()
 	for _, v in pairs(players) do
 		if v.PlayerData.job.name == 'ambulance' and v.PlayerData.job.onduty then
 			TriggerClientEvent('hospital:client:ambulanceAlert', v.PlayerData.source, coords, text)
@@ -99,15 +151,30 @@ RegisterNetEvent('hospital:server:ambulanceAlert', function(text)
 	end
 end)
 
-RegisterNetEvent('hospital:server:LeaveBed', function(id, hospitalIndex)
-	TriggerClientEvent('hospital:client:SetBed', -1, id, false, hospitalIndex)
+-- Marks the bed the caller is actually occupying as free again for all clients.
+-- Fix: the server never cleared its own occupancy, so a bed stayed claimed for the rest of the
+-- session once someone had used it. The broadcast also echoed the client's own id/hospitalIndex,
+-- which need not be the bed this player holds -- so a crafted call freed someone else's bed on
+-- every client while releasing only its own server-side record. Both now come from PlayerBeds.
+RegisterNetEvent('hospital:server:LeaveBed', function()
+	local src = source
+	local bed = PlayerBeds[src]
+	if not bed then return end
+
+	local bedId, hospitalIndex = bed.bedId, bed.hospitalIndex
+	ReleaseBed(src)
+	TriggerClientEvent('hospital:client:SetBed', -1, bedId, false, hospitalIndex)
 end)
 
+-- Stores the calling player's current injury/bleed data server-side, used
+-- by status checks and doctor treatment.
 RegisterNetEvent('hospital:server:SyncInjuries', function(data)
 	local src = source
 	PlayerInjuries[src] = data
 end)
 
+-- Stores the calling player's list of recorded weapon-wound entries
+-- server-side.
 RegisterNetEvent('hospital:server:SetWeaponDamage', function(data)
 	local src = source
 	local Player = TMGCore.Functions.GetPlayer(src)
@@ -116,12 +183,17 @@ RegisterNetEvent('hospital:server:SetWeaponDamage', function(data)
 	end
 end)
 
+-- Clears the calling player's tracked weapon wounds, both in memory and in
+-- their persisted 'injuries' metadata.
 RegisterNetEvent('hospital:server:RestoreWeaponDamage', function()
 	local src = source
 	local Player = TMGCore.Functions.GetPlayer(src)
-	Player.Functions.SetMetaData('injuries', data)
+	if not Player then return end
+	PlayerWeaponWounds[Player.PlayerData.source] = nil
+	Player.Functions.SetMetaData('injuries', {})
 end)
 
+-- Persists the calling player's dead/alive state to their metadata.
 RegisterNetEvent('hospital:server:SetDeathStatus', function(isDead)
 	local src = source
 	local Player = TMGCore.Functions.GetPlayer(src)
@@ -130,6 +202,7 @@ RegisterNetEvent('hospital:server:SetDeathStatus', function(isDead)
 	end
 end)
 
+-- Persists the calling player's last-stand state to their metadata.
 RegisterNetEvent('hospital:server:SetLaststandStatus', function(bool)
 	local src = source
 	local Player = TMGCore.Functions.GetPlayer(src)
@@ -138,6 +211,7 @@ RegisterNetEvent('hospital:server:SetLaststandStatus', function(bool)
 	end
 end)
 
+-- Persists the calling player's current armor value to their metadata.
 RegisterNetEvent('hospital:server:SetArmor', function(amount)
 	local src = source
 	local Player = TMGCore.Functions.GetPlayer(src)
@@ -146,6 +220,8 @@ RegisterNetEvent('hospital:server:SetArmor', function(amount)
 	end
 end)
 
+-- Doctor-side wound treatment: if the caller is on the ambulance job,
+-- consumes a bandage from them and fully heals the target patient.
 RegisterNetEvent('hospital:server:TreatWounds', function(playerId)
 	local src = source
 	local Player = TMGCore.Functions.GetPlayer(src)
@@ -159,6 +235,8 @@ RegisterNetEvent('hospital:server:TreatWounds', function(playerId)
 	end
 end)
 
+-- Registers the calling player as an on-duty ambulance doctor, increments
+-- and broadcasts the global doctor count.
 RegisterNetEvent('hospital:server:AddDoctor', function(job)
 	if job == 'ambulance' then
 		local src = source
@@ -168,6 +246,8 @@ RegisterNetEvent('hospital:server:AddDoctor', function(job)
 	end
 end)
 
+-- Deregisters the calling player as an on-duty ambulance doctor,
+-- decrements and broadcasts the global doctor count.
 RegisterNetEvent('hospital:server:RemoveDoctor', function(job)
 	if job == 'ambulance' then
 		local src = source
@@ -177,8 +257,12 @@ RegisterNetEvent('hospital:server:RemoveDoctor', function(job)
 	end
 end)
 
+-- On disconnect, removes the player from the on-duty doctor count if they
+-- were registered as one, and frees any bed they were still occupying.
 AddEventHandler('playerDropped', function()
 	local src = source
+	-- Fix: a player who disconnected while in a bed left it flagged as occupied.
+	ReleaseBed(src)
 	if Doctors[src] then
 		doctorCount = doctorCount - 1
 		TriggerClientEvent('hospital:client:SetDoctorCount', -1, doctorCount)
@@ -186,6 +270,10 @@ AddEventHandler('playerDropped', function()
 	end
 end)
 
+-- Revives a target patient if the caller is an EMS doctor or holds a first
+-- aid kit; charges cash for the 'oldMan' (self-service) path, otherwise
+-- just consumes the kit. If neither condition is met the revive is simply
+-- refused.
 RegisterNetEvent('hospital:server:RevivePlayer', function(playerId, isOldMan)
 	local src = source
 	local Player = TMGCore.Functions.GetPlayer(src)
@@ -207,30 +295,22 @@ RegisterNetEvent('hospital:server:RevivePlayer', function(playerId, isOldMan)
 				TriggerClientEvent('hospital:client:Revive', Patient.PlayerData.source)
 			end
 		else
-    -- NEW: Use your dedicated NoSQL Ban export
-    local banData = {
-        name = GetPlayerName(src),
-        license = TMGCore.Functions.GetIdentifier(src, 'license'),
-        discord = TMGCore.Functions.GetIdentifier(src, 'discord'),
-        ip = TMGCore.Functions.GetIdentifier(src, 'ip'),
-        reason = 'Trying to revive themselves or other players (Exploiting)',
-        expire = 2147483647,
-        bannedby = 'TMG_Mainframe'
-    }
-    exports['tmgnosql']:SaveBanNoSQL(banData.license, banData)
-    
-    TriggerEvent('tmg-log:server:CreateLog', 'ambulancejob', 'Player Banned', 'red', 
-        string.format('%s was banned for Exploiting revive triggers', GetPlayerName(src)), true)
-    DropPlayer(src, 'You were permanently banned by the server for: Exploiting')
-end
+			-- Fix: this branch used to permanently ban the caller. Losing the ambulance
+			-- job, going off duty or having the first aid kit consumed between the
+			-- client request and this handler are all things that happen to legitimate
+			-- players, so the revive is refused with a notification instead.
+			TriggerClientEvent('TMGCore:Notify', src, Lang:t('error.no_firstaid'), 'error')
+		end
 	end
 end)
 
+-- Notifies all on-duty doctors that a patient needs attention at the given
+-- hospital, throttled by Config.DocCooldown to prevent alert spam.
 RegisterNetEvent('hospital:server:SendDoctorAlert', function(hospitalName)
 	local src = source
 	if not doctorCalled then
 		doctorCalled = true
-		local players = TMGCore.Functions.GetQBPlayers()
+		local players = TMGCore.Functions.GetTMGPlayers()
 		for _, v in pairs(players) do
 			if v.PlayerData.job.name == 'ambulance' and v.PlayerData.job.onduty then
 				TriggerClientEvent('TMGCore:Notify', v.PlayerData.source, Lang:t('info.dr_needed', { hospital = hospitalName }), 'ambulance')
@@ -244,6 +324,8 @@ RegisterNetEvent('hospital:server:SendDoctorAlert', function(hospitalName)
 	end
 end)
 
+-- Forwards a first-aid-use attempt to the target player's client to confirm
+-- whether they can currently be helped.
 RegisterNetEvent('hospital:server:UseFirstAid', function(targetId)
 	local src = source
 	local Target = TMGCore.Functions.GetPlayer(targetId)
@@ -252,6 +334,9 @@ RegisterNetEvent('hospital:server:UseFirstAid', function(targetId)
 	end
 end)
 
+-- Relays the target's "can be helped" answer back to the would-be helper:
+-- starts the CPR help sequence if allowed, otherwise notifies them it's not
+-- possible.
 RegisterNetEvent('hospital:server:CanHelp', function(helperId, canHelp)
 	local src = source
 	if canHelp then
@@ -261,24 +346,29 @@ RegisterNetEvent('hospital:server:CanHelp', function(helperId, canHelp)
 	end
 end)
 
+-- Consumes one bandage from the calling player's inventory.
 RegisterNetEvent('hospital:server:removeBandage', function()
 	local Player = TMGCore.Functions.GetPlayer(source)
 	if not Player then return end
 	exports['tmg-inventory']:RemoveItem(source, 'bandage', 1, false, 'hospital:server:removeBandage')
 end)
 
+-- Consumes one IFAK from the calling player's inventory.
 RegisterNetEvent('hospital:server:removeIfaks', function()
 	local Player = TMGCore.Functions.GetPlayer(source)
 	if not Player then return end
 	exports['tmg-inventory']:RemoveItem(source, 'ifaks', 1, false, 'hospital:server:removeIfaks')
 end)
 
+-- Consumes one painkillers item from the calling player's inventory.
 RegisterNetEvent('hospital:server:removePainkillers', function()
 	local Player = TMGCore.Functions.GetPlayer(source)
 	if not Player then return end
 	exports['tmg-inventory']:RemoveItem(source, 'painkillers', 1, false, 'hospital:server:removePainkillers')
 end)
 
+-- Resets the calling player's hunger/thirst metadata to full and syncs the
+-- new values to their HUD.
 RegisterNetEvent('hospital:server:resetHungerThirst', function()
 	local Player = TMGCore.Functions.GetPlayer(source)
 
@@ -290,6 +380,8 @@ RegisterNetEvent('hospital:server:resetHungerThirst', function()
 	TriggerClientEvent('hud:client:UpdateNeeds', source, 100, 100)
 end)
 
+-- Opens the calling player's personal ambulance-job stash inventory, keyed
+-- by their citizen id.
 RegisterNetEvent('tmg-ambulancejob:server:stash', function()
 	local src = source
 	local Player = TMGCore.Functions.GetPlayer(src)
@@ -301,9 +393,10 @@ end)
 
 -- Callbacks
 
+-- Returns the number of currently on-duty ambulance doctors.
 TMGCore.Functions.CreateCallback('hospital:GetDoctors', function(_, cb)
 	local amount = 0
-	local players = TMGCore.Functions.GetQBPlayers()
+	local players = TMGCore.Functions.GetTMGPlayers()
 	for _, v in pairs(players) do
 		if v.PlayerData.job.name == 'ambulance' and v.PlayerData.job.onduty then
 			amount = amount + 1
@@ -312,6 +405,8 @@ TMGCore.Functions.CreateCallback('hospital:GetDoctors', function(_, cb)
 	cb(amount)
 end)
 
+-- Returns a combined injury report for the given player: bleed level,
+-- damaged limbs, and weapon-wound entries.
 TMGCore.Functions.CreateCallback('hospital:GetPlayerStatus', function(_, cb, playerId)
 	local Player = TMGCore.Functions.GetPlayer(playerId)
 	local injuries = {}
@@ -336,6 +431,7 @@ TMGCore.Functions.CreateCallback('hospital:GetPlayerStatus', function(_, cb, pla
 	cb(injuries)
 end)
 
+-- Returns the calling player's current bleed level, or nil if unknown.
 TMGCore.Functions.CreateCallback('hospital:GetPlayerBleeding', function(source, cb)
 	local src = source
 	if PlayerInjuries[src] and PlayerInjuries[src].isBleeding then
@@ -347,13 +443,15 @@ end)
 
 -- Commands
 
+-- /911e command: sends an EMS report (custom message or default civilian
+-- call text) with the caller's location to all on-duty doctors.
 TMGCore.Commands.Add('911e', Lang:t('info.ems_report'), { { name = 'message', help = Lang:t('info.message_sent') } }, false, function(source, args)
 	local src = source
 	local message
 	if args[1] then message = table.concat(args, ' ') else message = Lang:t('info.civ_call') end
 	local ped = GetPlayerPed(src)
 	local coords = GetEntityCoords(ped)
-	local players = TMGCore.Functions.GetQBPlayers()
+	local players = TMGCore.Functions.GetTMGPlayers()
 	for _, v in pairs(players) do
 		if v.PlayerData.job.name == 'ambulance' and v.PlayerData.job.onduty then
 			TriggerClientEvent('hospital:client:ambulanceAlert', v.PlayerData.source, coords, message)
@@ -361,6 +459,7 @@ TMGCore.Commands.Add('911e', Lang:t('info.ems_report'), { { name = 'message', he
 	end
 end)
 
+-- /status command: EMS-only, opens the health-check flow on a nearby player.
 TMGCore.Commands.Add('status', Lang:t('info.check_health'), {}, false, function(source, _)
 	local src = source
 	local Player = TMGCore.Functions.GetPlayer(src)
@@ -371,6 +470,8 @@ TMGCore.Commands.Add('status', Lang:t('info.check_health'), {}, false, function(
 	end
 end)
 
+-- /heal command: EMS-only, triggers the bandage/wound-treatment flow on a
+-- nearby player.
 TMGCore.Commands.Add('heal', Lang:t('info.heal_player'), {}, false, function(source, _)
 	local src = source
 	local Player = TMGCore.Functions.GetPlayer(src)
@@ -381,6 +482,8 @@ TMGCore.Commands.Add('heal', Lang:t('info.heal_player'), {}, false, function(sou
 	end
 end)
 
+-- /revivep command: EMS-only, triggers the first-aid revive flow on a
+-- nearby player.
 TMGCore.Commands.Add('revivep', Lang:t('info.revive_player'), {}, false, function(source, _)
 	local src = source
 	local Player = TMGCore.Functions.GetPlayer(src)
@@ -391,6 +494,8 @@ TMGCore.Commands.Add('revivep', Lang:t('info.revive_player'), {}, false, functio
 	end
 end)
 
+-- /revive command (admin): fully revives the target player id, or the
+-- caller themselves if no id is given.
 TMGCore.Commands.Add('revive', Lang:t('info.revive_player_a'), { { name = 'id', help = Lang:t('info.player_id') } }, false, function(source, args)
 	local src = source
 	if args[1] then
@@ -405,6 +510,8 @@ TMGCore.Commands.Add('revive', Lang:t('info.revive_player_a'), { { name = 'id', 
 	end
 end, 'admin')
 
+-- /setpain command (admin): forces bleed/bone trauma on the target player
+-- id, or the caller themselves if no id is given.
 TMGCore.Commands.Add('setpain', Lang:t('info.pain_level'), { { name = 'id', help = Lang:t('info.player_id') } }, false, function(source, args)
 	local src = source
 	if args[1] then
@@ -419,6 +526,8 @@ TMGCore.Commands.Add('setpain', Lang:t('info.pain_level'), { { name = 'id', help
 	end
 end, 'admin')
 
+-- /kill command (admin): kills the target player id, or the caller
+-- themselves if no id is given.
 TMGCore.Commands.Add('kill', Lang:t('info.kill'), { { name = 'id', help = Lang:t('info.player_id') } }, false, function(source, args)
 	local src = source
 	if args[1] then
@@ -433,6 +542,8 @@ TMGCore.Commands.Add('kill', Lang:t('info.kill'), { { name = 'id', help = Lang:t
 	end
 end, 'admin')
 
+-- /aheal command (admin): fully heals the target player id, or the caller
+-- themselves if no id is given.
 TMGCore.Commands.Add('aheal', Lang:t('info.heal_player_a'), { { name = 'id', help = Lang:t('info.player_id') } }, false, function(source, args)
 	local src = source
 	if args[1] then
@@ -449,6 +560,8 @@ end, 'admin')
 
 -- Items
 
+-- Handles using an 'ifaks' item: if the player still has it, triggers the
+-- client-side IFAK use flow.
 TMGCore.Functions.CreateUseableItem('ifaks', function(source, item)
 	local src = source
 	local Player = TMGCore.Functions.GetPlayer(src)
@@ -457,6 +570,8 @@ TMGCore.Functions.CreateUseableItem('ifaks', function(source, item)
 	end
 end)
 
+-- Handles using a 'bandage' item: if the player still has it, triggers the
+-- client-side bandage use flow.
 TMGCore.Functions.CreateUseableItem('bandage', function(source, item)
 	local src = source
 	local Player = TMGCore.Functions.GetPlayer(src)
@@ -465,6 +580,8 @@ TMGCore.Functions.CreateUseableItem('bandage', function(source, item)
 	end
 end)
 
+-- Handles using a 'painkillers' item: if the player still has it, triggers
+-- the client-side painkillers use flow.
 TMGCore.Functions.CreateUseableItem('painkillers', function(source, item)
 	local src = source
 	local Player = TMGCore.Functions.GetPlayer(src)
@@ -473,6 +590,8 @@ TMGCore.Functions.CreateUseableItem('painkillers', function(source, item)
 	end
 end)
 
+-- Handles using a 'firstaid' item: if the player still has it, triggers the
+-- client-side first-aid use flow.
 TMGCore.Functions.CreateUseableItem('firstaid', function(source, item)
 	local src = source
 	local Player = TMGCore.Functions.GetPlayer(src)
@@ -481,4 +600,5 @@ TMGCore.Functions.CreateUseableItem('firstaid', function(source, item)
 	end
 end)
 
+-- Export for other resources to query the current on-duty doctor count.
 exports('GetDoctorCount', function() return doctorCount end)

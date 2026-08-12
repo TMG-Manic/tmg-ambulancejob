@@ -26,3 +26,9 @@ client_scripts {
 server_scripts {
 	'server/main.lua'
 }
+
+-- Declares the tmg-core dependency this resource already relies on via
+-- exports['tmg-core']:GetCoreObject(). Without it FXServer starts this resource even when
+-- tmg-core failed, and it throws "No such export GetCoreObject" at load instead of
+-- refusing to start.
+dependencies { 'tmg-core' }

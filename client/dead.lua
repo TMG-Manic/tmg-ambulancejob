@@ -1,7 +1,7 @@
 local TMGCore = exports['tmg-core']:GetCoreObject()
 
-if not MedState then 
-    MedState = { isDead = false, inLastStand = false, deathTime = 0, emsNotified = false, isEscorted = false, isInBed = false } 
+if not MedState then
+    MedState = { isDead = false, inLastStand = false, deathTime = 0, emsNotified = false, isEscorted = false, isInBed = false }
 end
 
 local DeadState = {
@@ -14,6 +14,8 @@ local DeadState = {
 }
 
 
+-- Requests and waits (with a ~1s timeout) for an animation dictionary to
+-- load; returns true on success, false on timeout.
 local function loadAnimDict(dict)
     if HasAnimDictLoaded(dict) then return true end
     RequestAnimDict(dict)
@@ -26,6 +28,7 @@ local function loadAnimDict(dict)
     return true
 end
 
+-- Draws a centered HUD text string at the given screen position/scale/color.
 local function DrawTxt(x, y, width, height, scale, text, r, g, b, a)
     SetTextFont(GetConvar('tmg_locale', 'en') == 'en' and 4 or 1)
     SetTextProportional(0)
@@ -41,13 +44,17 @@ local function DrawTxt(x, y, width, height, scale, text, r, g, b, a)
 end
 
 
+-- Transitions the player into the dead state: notifies the server, waits
+-- for the ragdoll to settle, resurrects the ped in place (so it doesn't
+-- collapse further) and plays a dead pose animation (vehicle-specific if
+-- applicable), makes the ped invincible, and alerts EMS.
 function OnDeath()
-    if MedState.isDead then return end 
-    
+    if MedState.isDead then return end
+
     MedState.isDead = true
     TriggerServerEvent('hospital:server:SetDeathStatus', true)
     TriggerServerEvent('InteractSound_SV:PlayOnSource', 'demo', 0.1)
-    
+
     local ped = PlayerPedId()
 
     CreateThread(function()
@@ -64,16 +71,16 @@ function OnDeath()
             if IsPedInAnyVehicle(ped, false) then
                 local veh = GetVehiclePedIsIn(ped, false)
                 local vehseats = GetVehicleModelNumberOfSeats(GetEntityModel(veh))
-                
+
                 NetworkResurrectLocalPlayer(pos.x, pos.y, pos.z + 0.5, heading, true, false)
-                
+
                 for i = -1, vehseats - 1 do
                     if GetPedInVehicleSeat(veh, i) == ped or IsVehicleSeatFree(veh, i) then
                         SetPedIntoVehicle(ped, veh, i)
                         break
                     end
                 end
-                
+
                 if loadAnimDict(DeadState.vehDict) then
                     TaskPlayAnim(ped, DeadState.vehDict, DeadState.vehAnim, 1.0, 1.0, -1, 1, 0, 0, 0, 0)
                 end
@@ -92,9 +99,12 @@ function OnDeath()
 end
 
 
+-- Starts (once) the countdown loop that ticks MedState.deathTime down every
+-- second while dead; once it hits 0, holding [E] for holdToRespawn seconds
+-- triggers a hospital respawn.
 function DeathTimer()
     if DeadState.timerActive then return end
-    
+
     CreateThread(function()
         DeadState.timerActive = true
         DeadState.holdToRespawn = 5
@@ -118,29 +128,33 @@ function DeathTimer()
     end)
 end
 
+-- Watches network damage events for the local player's ped dying. First
+-- fatal hit puts them into last stand (via SetLaststand); if they die again
+-- while already in last stand, logs the kill, starts the death countdown,
+-- and calls OnDeath().
 AddEventHandler('gameEventTriggered', function(eventName, data)
     if eventName ~= 'CEventNetworkEntityDamage' then return end
 
     local victim, attacker, victimDied, weapon = data[1], data[2], data[4], data[7]
     if not IsEntityAPed(victim) then return end
-    
+
     if victimDied and NetworkGetPlayerIndexFromPed(victim) == PlayerId() and IsEntityDead(PlayerPedId()) then
         if not MedState.inLastStand then
             if SetLaststand then SetLaststand(true) end
         elseif MedState.inLastStand and not MedState.isDead then
             if SetLaststand then SetLaststand(false) end
-            
+
             local playerid = NetworkGetPlayerIndexFromPed(victim)
             local playerName = GetPlayerName(playerid) .. ' (' .. GetPlayerServerId(playerid) .. ')'
-            
+
             local killerId = NetworkGetPlayerIndexFromPed(attacker)
             local killerName = killerId ~= -1 and GetPlayerName(killerId) .. ' (' .. GetPlayerServerId(killerId) .. ')' or Lang:t('info.self_death')
-            
+
             local weaponLabel = (TMGCore.Shared.Weapons[weapon] and TMGCore.Shared.Weapons[weapon].label) or 'Unknown'
             local weaponName = (TMGCore.Shared.Weapons[weapon] and TMGCore.Shared.Weapons[weapon].name) or 'Unknown'
-            
+
             TriggerServerEvent('tmg-log:server:CreateLog', 'death', Lang:t('logs.death_log_title', { playername = playerName, playerid = GetPlayerServerId(playerid) }), 'red', Lang:t('logs.death_log_message', { killername = killerName, playername = playerName, weaponlabel = weaponLabel, weaponname = weaponName }))
-            
+
             MedState.deathTime = Config.DeathTime
             OnDeath()
             DeathTimer()
@@ -150,31 +164,35 @@ end)
 
 -- [[ 5. STATE CONTROL LOOP (UI & ANIMATIONS) ]]
 
+-- Main dead/last-stand loop: locks out most controls (leaving look/chat/
+-- voice/menu enabled), keeps the writhe/dead animation playing, and draws
+-- the respawn countdown or bleed-out/help-request HUD text depending on
+-- whether the player is fully dead or still in last stand.
 CreateThread(function()
 while true do
         local sleep = 1000
         if MedState.isDead or MedState.inLastStand then
-            sleep = 0 
+            sleep = 0
             local ped = PlayerPedId()
 
             DisableAllControlActions(0)
-            
+
             DisableControlAction(0, 36, true) -- INPUT_DUCK
             DisableControlAction(0, 289, true) -- INPUT_REPLAY_SCREENSHOT (F2 often interferes)
-            
+
             EnableControlAction(0, 1, true)   -- Look LR
             EnableControlAction(0, 2, true)   -- Look UD
             EnableControlAction(0, 245, true) -- Chat
             EnableControlAction(0, 249, true) -- Voice
             EnableControlAction(0, 322, true) -- ESC Menu
 
-            if not IsEntityPlayingAnim(ped, "combat@damage@writhe", "writhe_loop", 3) and 
-               not IsEntityPlayingAnim(ped, "dead", "dead_a", 3) and 
+            if not IsEntityPlayingAnim(ped, "combat@damage@writhe", "writhe_loop", 3) and
+               not IsEntityPlayingAnim(ped, "dead", "dead_a", 3) and
                not MedState.isInBed and not MedState.isEscorted then
-                
+
                 local dict = MedState.isDead and "dead" or "combat@damage@writhe"
                 local anim = MedState.isDead and "dead_a" or "writhe_loop"
-                
+
                 TaskPlayAnim(ped, dict, anim, 8.0, 8.0, -1, 1, 0, false, false, false)
             end
 
@@ -200,16 +218,16 @@ while true do
                 end
 
                 SetCurrentPedWeapon(ped, `WEAPON_UNARMED`, true)
-                
+
             elseif MedState.inLastStand then
                 if LaststandTime > Config.MinimumRevive then
                     DrawTxt(0.94, 1.44, 1.0, 1.0, 0.6, Lang:t('info.bleed_out', { time = math.ceil(LaststandTime) }), 255, 255, 255, 255)
                 else
                     DrawTxt(0.845, 1.44, 1.0, 1.0, 0.6, Lang:t('info.bleed_out_help', { time = math.ceil(LaststandTime) }), 255, 255, 255, 255)
-                    
+
                     if not MedState.emsNotified then
                         DrawTxt(0.91, 1.40, 1.0, 1.0, 0.6, Lang:t('info.request_help'), 255, 255, 255, 255)
-                        if IsControlJustPressed(0, 47) then 
+                        if IsControlJustPressed(0, 47) then
                             TriggerServerEvent('hospital:server:ambulanceAlert', Lang:t('info.civ_down'))
                             MedState.emsNotified = true
                         end

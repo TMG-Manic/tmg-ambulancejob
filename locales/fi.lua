@@ -1,3 +1,4 @@
+-- Finnish locale strings for tmg-ambulancejob (death/wound/revive notifications, hospital menus, EMS text, body-part and pain labels).
 local Translations = {
     error = {
         canceled = 'Peruutettu',

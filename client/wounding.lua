@@ -1,16 +1,20 @@
 local TMGCore = exports['tmg-core']:GetCoreObject()
 local prevPos = vector3(0, 0, 0)
 
+-- Reduces the bleed level by `level` (floored at 0), refreshes the bleed
+-- alert, and syncs the new bleed/injury state to the server.
 function RemoveBleed(level)
     -- TMG Nil-Guard: Ensure MedState exists before indexing
     if not MedState or not MedState.isBleeding then return end
     if MedState.isBleeding > 0 then
         MedState.isBleeding = math.max(0, MedState.isBleeding - level)
-        if DoBleedAlert then DoBleedAlert() end 
+        if DoBleedAlert then DoBleedAlert() end
         TriggerServerEvent('hospital:server:SyncInjuries', { limbs = BodyParts, isBleeding = MedState.isBleeding })
     end
 end
 
+-- Export used by other resources (e.g. items) to put the player onto the
+-- painkiller effect, optionally setting a specific dose count.
 exports('PainKillerLoop', function(pkAmount)
     if not MedState then return end
     if pkAmount then MedState.painkillerAmount = pkAmount end
@@ -18,6 +22,9 @@ exports('PainKillerLoop', function(pkAmount)
 end)
 
 
+-- Uses an IFAK item: plays a pill animation/progressbar, then consumes the
+-- item, relieves stress, heals a small amount of health, stacks a
+-- painkiller dose, and has a 50% chance to reduce bleeding by 1.
 RegisterNetEvent('hospital:client:UseIfaks', function()
     local ped = PlayerPedId()
     TMGCore.Functions.Progressbar('use_ifak', Lang:t('progress.ifaks'), 3000, false, true, {
@@ -32,10 +39,10 @@ RegisterNetEvent('hospital:client:UseIfaks', function()
         TriggerEvent('tmg-inventory:client:ItemBox', TMGCore.Shared.Items['ifaks'], 'remove')
         TriggerServerEvent('hud:server:RelieveStress', math.random(12, 24))
         SetEntityHealth(ped, GetEntityHealth(ped) + 10)
-        
+
         MedState.painkillerAmount = math.min(3, (MedState.painkillerAmount or 0) + 1)
         MedState.onPainKillers = true
-        
+
         if math.random(1, 100) < 50 then RemoveBleed(1) end
     end, function() -- Cancel
         StopAnimTask(ped, 'mp_suicide', 'pill', 1.0)
@@ -43,6 +50,9 @@ RegisterNetEvent('hospital:client:UseIfaks', function()
     end)
 end)
 
+-- Uses a bandage item: plays an inspecting animation/progressbar, then
+-- consumes the item, heals a small amount of health, has a 50% chance to
+-- reduce bleeding by 1, and a small chance to also clear minor injuries.
 RegisterNetEvent('hospital:client:UseBandage', function()
     local ped = PlayerPedId()
     TMGCore.Functions.Progressbar('use_bandage', Lang:t('progress.bandage'), 4000, false, true, {
@@ -56,7 +66,7 @@ RegisterNetEvent('hospital:client:UseBandage', function()
         TriggerServerEvent('hospital:server:removeBandage')
         TriggerEvent('tmg-inventory:client:ItemBox', TMGCore.Shared.Items['bandage'], 'remove')
         SetEntityHealth(ped, GetEntityHealth(ped) + 10)
-        
+
         if math.random(1, 100) < 50 then RemoveBleed(1) end
         if math.random(1, 100) < 7 and ResetPartial then ResetPartial() end
     end, function() -- Cancel
@@ -65,6 +75,9 @@ RegisterNetEvent('hospital:client:UseBandage', function()
     end)
 end)
 
+-- Uses a painkillers item: plays a pill animation/progressbar, then
+-- consumes the item and stacks a painkiller dose (suppresses injury
+-- penalties while active, see wounding pulse thread below).
 RegisterNetEvent('hospital:client:UsePainkillers', function()
     local ped = PlayerPedId()
     TMGCore.Functions.Progressbar('use_painkillers', Lang:t('progress.painkillers'), 3000, false, true, {
@@ -77,7 +90,7 @@ RegisterNetEvent('hospital:client:UsePainkillers', function()
         StopAnimTask(ped, 'mp_suicide', 'pill', 1.0)
         TriggerServerEvent('hospital:server:removePainkillers')
         TriggerEvent('tmg-inventory:client:ItemBox', TMGCore.Shared.Items['painkillers'], 'remove')
-        
+
         MedState.painkillerAmount = math.min(3, (MedState.painkillerAmount or 0) + 1)
         MedState.onPainKillers = true
     end, function() -- Cancel
@@ -86,6 +99,8 @@ RegisterNetEvent('hospital:client:UsePainkillers', function()
     end)
 end)
 
+-- Continuously applies MedState.movementRate (set by the injury pulse
+-- below) as a ped move-rate override while it's below normal speed.
 CreateThread(function()
     while true do
         -- TMG Nil-Guard: Prevents crash if MedState loads slow
@@ -93,20 +108,25 @@ CreateThread(function()
             SetPedMoveRateOverride(PlayerPedId(), MedState.movementRate)
             Wait(0)
         else
-            Wait(1000) 
+            Wait(1000)
         end
     end
 end)
 
 -- [[ 4. FORENSIC & TRAUMA PULSE (1Hz) ]]
+-- Once-per-second injury/bleed simulation tick: derives movement speed
+-- penalty from the worst current injury, counts down active painkiller
+-- doses, and while actively bleeding (and not in bed/dead/last-stand)
+-- periodically dims/flashes the screen, may ragdoll the player, and
+-- accelerates bleed severity based on movement and elapsed time.
 CreateThread(function()
     Wait(2500)
     prevPos = GetEntityCoords(PlayerPedId(), true)
     local pkTick = 0
 
     while true do
-        Wait(1000) 
-        
+        Wait(1000)
+
         -- FINAL STABILITY GUARD: Exit loop iteration if Core Matrix is missing
         if not MedState or not BodyParts then goto continue end
 
@@ -139,14 +159,14 @@ CreateThread(function()
 
         -- C. Trauma Bleed & Blackout Matrices (Line 130 Fix)
         if (MedState.isBleeding or 0) > 0 and not MedState.onPainKillers and not MedState.isInBed and not MedState.isDead and not MedState.inLastStand then
-            
+
             -- Ensure trackers are initialized before math operations
             MedState.fadeOut = MedState.fadeOut or 0
             MedState.blackout = MedState.blackout or 0
             MedState.advanceBleed = MedState.advanceBleed or 0
-            
+
             MedState.fadeOut = MedState.fadeOut + 1
-            
+
             -- Vision Fade Logic (Safety Compare)
             if MedState.fadeOut >= (Config.FadeOutTimer or 10) then
                 MedState.fadeOut = 0
